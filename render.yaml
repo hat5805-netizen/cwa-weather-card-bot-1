@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: cwa-weather-card-bot
+    env: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: USE_SELENIUM
+        value: "1"
