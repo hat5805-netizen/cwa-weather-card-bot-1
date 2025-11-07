@@ -38,13 +38,12 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# 使用較寬鬆的 scope，避免 Shared Drive 寫入被 drive.file 侷限
 _SCOPES = ["https://www.googleapis.com/auth/drive"]
 _DRIVE_SVC = None
 _SA_EMAIL = None
+_IS_SHARED_DRIVE = None  # 會在首次使用時檢查
 
 def _drive_client():
-    """以 Service Account 初始化 Drive client（使用 Base64 JSON 環境變數）"""
     global _DRIVE_SVC, _SA_EMAIL
     if _DRIVE_SVC:
         return _DRIVE_SVC
@@ -65,6 +64,36 @@ def _drive_client():
     except Exception as e:
         log.error(f"初始化 Google Drive 失敗：{e}")
         return None
+
+def _ensure_shared_drive_folder(service, folder_id):
+    """
+    確認 folder_id 是否位於「共享雲端硬碟」。
+    是：回傳 True；否：回傳 False（並在 log 說明要改用 Shared Drive）。
+    """
+    global _IS_SHARED_DRIVE
+    if _IS_SHARED_DRIVE is not None:
+        return _IS_SHARED_DRIVE
+    try:
+        meta = service.files().get(
+            fileId=folder_id,
+            fields="id, name, driveId, parents",
+            supportsAllDrives=True
+        ).execute()
+        if meta.get("driveId"):
+            log.info(f"確認：目標資料夾位於 Shared Drive（driveId={meta['driveId']}）")
+            _IS_SHARED_DRIVE = True
+        else:
+            log.error(
+                "偵測到 GDRIVE_FOLDER_ID 指向『我的雲端硬碟』而非『共享雲端硬碟』：\n"
+                "Service Account 沒有個人儲存空間，無法上傳。\n"
+                "請改用 Shared Drive：建立 Shared Drive → 將 Service Account 加為成員 → "
+                "在 Shared Drive 內建立資料夾並使用其 folder ID。"
+            )
+            _IS_SHARED_DRIVE = False
+    except Exception as e:
+        log.error(f"讀取資料夾資訊失敗，無法判斷是否 Shared Drive：{e}")
+        _IS_SHARED_DRIVE = False
+    return _IS_SHARED_DRIVE
 
 def drive_file_exists(service, folder_id, filename):
     """查詢指定資料夾下是否已有同名檔案（支援共享雲端硬碟）"""
@@ -88,7 +117,11 @@ def drive_file_exists(service, folder_id, filename):
         return None
 
 def upload_to_drive(filepath):
-    """將本地圖片上傳到指定的 Google Drive 資料夾；已存在則跳過（支援共享雲端硬碟）"""
+    """
+    將本地圖片上傳到指定的 Google Drive 資料夾；
+    - 僅 Shared Drive 允許（Service Account 沒有個人配額）
+    - 已存在則跳過
+    """
     folder_id = os.getenv("GDRIVE_FOLDER_ID")
     if not folder_id:
         log.warning("未設定 GDRIVE_FOLDER_ID，略過上傳至 Google Drive")
@@ -96,6 +129,11 @@ def upload_to_drive(filepath):
 
     svc = _drive_client()
     if not svc:
+        return None
+
+    # 檢查目標資料夾是否在 Shared Drive
+    if not _ensure_shared_drive_folder(svc, folder_id):
+        log.error("因目標資料夾不在 Shared Drive，已跳過上傳（避免 403 storageQuotaExceeded）。")
         return None
 
     filename = os.path.basename(filepath)
@@ -122,6 +160,7 @@ def upload_to_drive(filepath):
     except Exception as e:
         log.error(f"上傳至 Drive 失敗：{e}")
         return None
+
 
 # ===== 下載工具：回傳 (path, is_new) =====
 def download_image(img_url, filename):
