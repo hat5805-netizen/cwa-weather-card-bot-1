@@ -166,7 +166,7 @@ def parse_weather_ad_card():
         saved_path, is_new = download_image(full_url, filename)
         if saved_path and is_new:
             # 推送到 Telegram（標題帶上時間與檔名）
-            caption = f"CWA 天氣小卡\n檔名：{filename}\n時間：{datetime.now():%Y-%m-%d %H:%M:%S}"
+            caption = f"CWA 天氣小卡\n時間：{datetime.now():%Y-%m-%d %H:%M:%S}"
             tg_send_photo(saved_path, caption=caption)
         return saved_path
 
