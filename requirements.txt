@@ -5,3 +5,6 @@ webdriver-manager    # 本地也能用；Docker 版不依賴它
 beautifulsoup4
 lxml
 gunicorn
+google-api-python-client
+google-auth
+google-auth-httplib2
