@@ -5,11 +5,9 @@ import os
 import time
 import logging
 import requests
-import base64
-import json
 from datetime import datetime
 
-# ============== 共同設定 ==============
+# ============== 基本設定 ==============
 PAGE_URL = "https://www.cwa.gov.tw/V8/C/"
 BASE_URL = "https://www.cwa.gov.tw"
 DOWNLOAD_DIR = "weather_cards"
@@ -25,148 +23,85 @@ log_filename = os.path.join(LOG_DIR, datetime.now().strftime("cwa_%Y%m%d.log"))
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(log_filename, encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.FileHandler(log_filename, encoding="utf-8"),
+              logging.StreamHandler()]
 )
 log = logging.getLogger(__name__)
 
-# ===== Google Drive 相依 =====
-from google.oauth2.service_account import Credentials as SA_Credentials
-from google.oauth2.credentials import Credentials as UserCredentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from google.auth.transport.requests import Request as AuthRequest
+# ============== Telegram 設定 ==============
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_CHAT_IDS = [c.strip() for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
 
-_SCOPES = ["https://www.googleapis.com/auth/drive"]  # 或用 drive.file
-_DRIVE_SVC = None
-_AUTH_MODE = None  # "oauth" | "sa"
-_SA_EMAIL = None
-
-def _drive_client():
-    """優先使用 OAuth token；沒有就回退 Service Account。"""
-    global _DRIVE_SVC, _AUTH_MODE, _SA_EMAIL
-    if _DRIVE_SVC:
-        return _DRIVE_SVC
-
-    # === 1) 優先：OAuth（我的雲端硬碟） ===
-    b64_token = os.getenv("GDRIVE_OAUTH_TOKEN_B64")
-    if b64_token:
-        try:
-            raw = base64.b64decode(b64_token).decode("utf-8")
-            info = json.loads(raw)
-            creds = UserCredentials.from_authorized_user_info(info, scopes=_SCOPES)
-            # 若 token 過期，線上自動 refresh
-            if not creds.valid and creds.refresh_token:
-                creds.refresh(AuthRequest())
-            _DRIVE_SVC = build("drive", "v3", credentials=creds, cache_discovery=False)
-            _AUTH_MODE = "oauth"
-            log.info("Google Drive 認證模式：OAuth（我的雲端硬碟）")
-            return _DRIVE_SVC
-        except Exception as e:
-            log.error(f"初始化 OAuth 憑證失敗，將回退 Service Account：{e}")
-
-    # === 2) 回退：Service Account（適合 Shared Drive） ===
-    b64_sa = os.getenv("GDRIVE_SA_JSON_B64")
-    if b64_sa:
-        try:
-            raw = base64.b64decode(b64_sa).decode("utf-8")
-            info = json.loads(raw)
-            creds = SA_Credentials.from_service_account_info(info, scopes=_SCOPES)
-            _SA_EMAIL = info.get("client_email")
-            _DRIVE_SVC = build("drive", "v3", credentials=creds, cache_discovery=False)
-            _AUTH_MODE = "sa"
-            log.info(f"Google Drive 認證模式：Service Account（{_SA_EMAIL}）")
-            return _DRIVE_SVC
-        except Exception as e:
-            log.error(f"初始化 Service Account 失敗：{e}")
-
-    log.warning("未提供任何 Google Drive 憑證（GDRIVE_OAUTH_TOKEN_B64 / GDRIVE_SA_JSON_B64）。")
-    return None
-
-def drive_file_exists(service, folder_id, filename):
-    """查詢資料夾下是否已有同名檔案。共用參數對 My Drive/Shared Drive 皆可。"""
-    try:
-        q = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
-        resp = service.files().list(
-            q=q,
-            fields="files(id, name)",
-            pageSize=1,
-            includeItemsFromAllDrives=True,
-            supportsAllDrives=True,
-            corpora="allDrives"
-        ).execute()
-        files = resp.get("files", [])
-        return files[0] if files else None
-    except Exception as e:
-        log.warning(f"查詢 Drive 檔案失敗：{e}")
-        return None
-
-def upload_to_drive(filepath):
+def tg_send_photo(file_path, caption=None, parse_mode=None):
     """
-    上傳到 Google Drive 指定資料夾：
-    - OAuth：可上傳到『我的雲端硬碟』資料夾
-    - SA：建議用 Shared Drive（否則會遇到 storageQuotaExceeded）
+    先用 sendPhoto（Telegram 會當作圖片貼文顯示）；
+    若因大小/格式失敗，再改 sendDocument 當檔案傳。
     """
-    folder_id = os.getenv("GDRIVE_FOLDER_ID")
-    if not folder_id:
-        log.warning("未設定 GDRIVE_FOLDER_ID，略過上傳至 Google Drive")
-        return None
+    if not TG_TOKEN or not TG_CHAT_IDS:
+        log.warning("未設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，略過推播")
+        return False
 
-    svc = _drive_client()
-    if not svc:
-        return None
+    api_base = f"https://api.telegram.org/bot{TG_TOKEN}"
+    ok_any = False
+    for chat_id in TG_CHAT_IDS:
+        # 1) sendPhoto
+        try:
+            with open(file_path, "rb") as f:
+                files = {"photo": (os.path.basename(file_path), f, "image/png")}
+                data = {"chat_id": chat_id}
+                if caption:
+                    data["caption"] = caption
+                if parse_mode:
+                    data["parse_mode"] = parse_mode
+                r = requests.post(f"{api_base}/sendPhoto", data=data, files=files, timeout=30)
+            if r.ok and r.json().get("ok"):
+                log.info(f"sendPhoto 成功 → chat {chat_id}")
+                ok_any = True
+                continue
+            else:
+                log.warning(f"sendPhoto 失敗 → chat {chat_id}，嘗試 sendDocument；resp={r.text}")
+        except Exception as e:
+            log.warning(f"sendPhoto 例外 → chat {chat_id}：{e}；改用 sendDocument")
 
-    # 如果是 SA，而且 folder 在 My Drive，會遇到 quota 問題；這裡僅提醒，不阻擋
-    if _AUTH_MODE == "sa":
-        log.info("（提醒）目前使用 Service Account，請確保目標資料夾位於 Shared Drive。")
+        # 2) 後援：sendDocument
+        try:
+            with open(file_path, "rb") as f:
+                files = {"document": (os.path.basename(file_path), f, "application/octet-stream")}
+                data = {"chat_id": chat_id}
+                if caption:
+                    data["caption"] = caption
+                r = requests.post(f"{api_base}/sendDocument", data=data, files=files, timeout=60)
+            if r.ok and r.json().get("ok"):
+                log.info(f"sendDocument 成功 → chat {chat_id}")
+                ok_any = True
+            else:
+                log.error(f"sendDocument 仍失敗 → chat {chat_id}；resp={r.text}")
+        except Exception as e:
+            log.error(f"sendDocument 例外 → chat {chat_id}：{e}")
+    return ok_any
 
-    filename = os.path.basename(filepath)
-    exists = drive_file_exists(svc, folder_id, filename)
-    if exists:
-        log.info(f"Drive 已存在：{filename}（id={exists['id']}）")
-        return exists
-
-    try:
-        media = MediaFileUpload(filepath, mimetype="image/png", resumable=False)
-        meta = {"name": filename, "parents": [folder_id]}
-        file = svc.files().create(
-            body=meta,
-            media_body=media,
-            fields="id, webViewLink, webContentLink",
-            supportsAllDrives=True
-        ).execute()
-        log.info(f"上傳至 Drive 成功：{filename}（id={file['id']}）")
-        log.info(f"webViewLink: {file.get('webViewLink')}")
-        log.info(f"webContentLink: {file.get('webContentLink')}")
-        return file
-    except Exception as e:
-        log.error(f"上傳至 Drive 失敗：{e}")
-        return None
-
-# ===== 下載工具：回傳 (path, is_new) =====
+# ============== 下載工具 ==============
 def download_image(img_url, filename):
-    filepath = os.path.join(DOWNLOAD_DIR, filename)
-    if os.path.exists(filepath):
+    path = os.path.join(DOWNLOAD_DIR, filename)
+    if os.path.exists(path):
         log.info(f"檔案已存在: {filename}")
-        return filepath, False
+        return path, False
     log.info(f"下載圖片: {img_url}")
     for _ in range(3):
         try:
             r = requests.get(img_url, headers=HEADERS, timeout=20)
             r.raise_for_status()
-            with open(filepath, "wb") as f:
+            with open(path, "wb") as f:
                 f.write(r.content)
             log.info(f"下載成功: {filename} ({len(r.content):,} bytes)")
-            return filepath, True
+            return path, True
         except Exception as e:
             log.warning(f"下載重試中: {e}")
             time.sleep(2)
     log.error("下載失敗")
     return None, False
 
-# ===== Selenium：抓 .weather-AD 裡的 WT_L =====
+# ============== Selenium 抓圖 ==============
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -194,15 +129,15 @@ def init_driver():
     if os.path.exists(driver_bin):
         try:
             service = Service(executable_path=driver_bin)
-            driver = webdriver.Chrome(service=service, options=options)
+            drv = webdriver.Chrome(service=service, options=options)
             log.info(f"使用內建 chromedriver: {driver_bin}")
-            return driver
+            return drv
         except Exception as e:
             log.warning(f"內建 chromedriver 失敗：{e}")
 
-    driver = webdriver.Chrome(options=options)
+    drv = webdriver.Chrome(options=options)
     log.info("使用系統 Chrome 成功啟動")
-    return driver
+    return drv
 
 def parse_weather_ad_card():
     driver = None
@@ -217,20 +152,22 @@ def parse_weather_ad_card():
         )
 
         log.info("等待 WT_L 圖片出現...")
-        img_elements = WebDriverWait(driver, 25).until(
+        imgs = WebDriverWait(driver, 25).until(
             EC.presence_of_all_elements_located(
                 (By.CSS_SELECTOR, ".weather-AD img[src*='WT_L']")
             )
         )
 
-        img = img_elements[0]
+        img = imgs[0]
         src = img.get_attribute("src") or ""
         full_url = src if src.startswith("http") else BASE_URL + src
         filename = full_url.split("/")[-1].split("?")[0]
 
         saved_path, is_new = download_image(full_url, filename)
         if saved_path and is_new:
-            upload_to_drive(saved_path)
+            # 推送到 Telegram（標題帶上時間與檔名）
+            caption = f"CWA 天氣小卡\n檔名：{filename}\n時間：{datetime.now():%Y-%m-%d %H:%M:%S}"
+            tg_send_photo(saved_path, caption=caption)
         return saved_path
 
     except Exception as e:
@@ -254,10 +191,6 @@ if __name__ == "__main__":
         print(f"   耗時: {elapsed:.2f} 秒")
     else:
         print("\n下載失敗！請查看 logs/ 資料夾")
-
-
-
-
 
 quit()
 
